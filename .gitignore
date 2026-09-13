@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+.DS_Store
+
+# Local machine/network settings. See .env.example.
+.env

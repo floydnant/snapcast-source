@@ -1,0 +1,12 @@
+# The tcp:// source this project feeds, shown in context.
+#
+# Note it is an extra `source =` line inside the EXISTING [stream] section. A second
+# [stream] header would also re-scope buffer/chunk_ms/codec and can silently change
+# the streams already defined above it.
+
+[stream]
+source = pipe:///tmp/shairport-sync-audio?name=AirPlay&mode=read&sampleformat=44100:16:2
+source = tcp://0.0.0.0:4953?name=Mac&mode=server&sampleformat=48000:16:2&codec=pcm&chunk_ms=10
+buffer = 1000
+chunk_ms = 10
+codec = pcm
