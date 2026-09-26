@@ -54,11 +54,15 @@ type Hello struct {
 
 type Control struct {
 	Type   string `json:"type"`
+	Code   string `json:"code,omitempty"` // machine-readable detail for "error"
 	By     string `json:"by,omitempty"`
 	Reason string `json:"reason,omitempty"`
 	Active string `json:"active,omitempty"`
 	Since  int64  `json:"since,omitempty"`
 	Format string `json:"format,omitempty"`
+	// Snapserver's JSON-RPC port on the relay's host, so the app can offer speaker
+	// volume and mute without configuring a second address.
+	Control int `json:"control,omitempty"`
 }
 
 type Config struct {
@@ -71,6 +75,9 @@ type Config struct {
 	ReadTimeout  time.Duration
 	HelloTimeout time.Duration
 	PingInterval time.Duration
+
+	// Snapserver JSON-RPC port advertised to sources; 0 to not advertise.
+	ControlPort int
 
 	// Chunks buffered between network reads and the sink. When the sink stalls
 	// (snapserver stopped), newest audio is dropped rather than blocking the reader.
@@ -98,6 +105,11 @@ type Relay struct {
 	audio     chan []byte
 	forwarded atomic.Uint64
 	dropped   atomic.Uint64
+
+	// OnActiveChange is told whenever a source starts (true, including a takeover by
+	// another source) or the last one ends (false). Called outside the lock. Set it
+	// before Serve.
+	OnActiveChange func(active bool)
 }
 
 func NewRelay(cfg Config) *Relay {
@@ -194,7 +206,7 @@ func (r *Relay) drain(w io.Writer, stop <-chan struct{}) bool {
 func (r *Relay) Status() Control {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	m := Control{Type: "status", Format: r.cfg.Format}
+	m := Control{Type: "status", Format: r.cfg.Format, Control: r.cfg.ControlPort}
 	if c := r.current; c != nil {
 		m.Active = c.name
 		m.Since = c.started.Unix()
@@ -217,6 +229,9 @@ func (r *Relay) claim(s *session) {
 		prev.close()
 	}
 	log.Printf("%v streaming", s)
+	if r.OnActiveChange != nil {
+		r.OnActiveChange(true)
+	}
 }
 
 func (r *Relay) release(s *session, reason string) {
@@ -228,6 +243,9 @@ func (r *Relay) release(s *session, reason string) {
 	r.mu.Unlock()
 	if wasCurrent {
 		log.Printf("%v ended: %s", s, reason)
+		if r.OnActiveChange != nil {
+			r.OnActiveChange(false)
+		}
 	}
 }
 
@@ -273,7 +291,6 @@ func (r *Relay) handle(c net.Conn) {
 	}
 
 	s := &session{
-		id:      r.nextID.Add(1),
 		remote:  remote,
 		conn:    c,
 		started: time.Now(),
@@ -322,6 +339,7 @@ func (r *Relay) handle(c net.Conn) {
 		s.name = "raw " + remote
 	}
 
+	s.id = r.nextID.Add(1)
 	r.claim(s)
 	defer s.close()
 
@@ -332,8 +350,20 @@ func (r *Relay) handle(c net.Conn) {
 	if !s.raw {
 		go r.ping(s)
 	}
-	r.release(s, r.pump(s, br))
+	reason, silent := r.pump(s, br)
+	if silent {
+		_ = s.send(Control{Type: "error", Code: NoAudioCode, Reason: NoAudioReason})
+	}
+	r.release(s, reason)
 }
+
+// Sent before dropping a source that stopped sending audio on a live connection. The
+// app matches on the code: it means either the Mac's capture stalled (stop, don't
+// loop) or the network stalled and recovered (retry), and only the app can tell which.
+const (
+	NoAudioCode   = "no_audio"
+	NoAudioReason = "The relay received no audio for 3 seconds."
+)
 
 func (r *Relay) ping(s *session) {
 	t := time.NewTicker(r.cfg.PingInterval)
@@ -351,8 +381,9 @@ func (r *Relay) ping(s *session) {
 	}
 }
 
-// pump forwards whole frames until the source stops, and says why.
-func (r *Relay) pump(s *session, rd io.Reader) string {
+// pump forwards whole frames until the source stops, and says why. silent reports
+// that the source went quiet on a live connection, as opposed to disconnecting.
+func (r *Relay) pump(s *session, rd io.Reader) (reason string, silent bool) {
 	buf := make([]byte, 16*1024)
 	var carry []byte
 	for {
@@ -371,17 +402,17 @@ func (r *Relay) pump(s *session, rd io.Reader) string {
 		if err != nil {
 			select {
 			case <-s.done:
-				return "closed"
+				return "closed", false
 			default:
 			}
 			var ne net.Error
 			switch {
 			case errors.Is(err, io.EOF):
-				return "disconnected"
+				return "disconnected", false
 			case errors.As(err, &ne) && ne.Timeout():
-				return fmt.Sprintf("no audio for %v", r.cfg.ReadTimeout)
+				return fmt.Sprintf("no audio for %v", r.cfg.ReadTimeout), true
 			default:
-				return err.Error()
+				return err.Error(), false
 			}
 		}
 	}

@@ -17,11 +17,18 @@ public final class PCMConverter {
     private let outBuffer: AVAudioPCMBuffer
     private let maxInputFrames: AVAudioFrameCount
 
-    /// Peak magnitude of the most recent input buffer, 0...1.
+    /// Peak magnitude of the most recent buffer as sent, i.e. after gain. 0...1.
     public private(set) var peak: Float = 0
 
-    public init(input: AVAudioFormat, maxInputFrames: AVAudioFrameCount = 16_384) throws {
+    private let gain: GainControl
+    /// Audio-thread only: the gain the last buffer ended on, so changes ramp smoothly
+    /// across the next buffer instead of stepping (a step is an audible click).
+    private var appliedGain: Float
+
+    public init(input: AVAudioFormat, gain: GainControl = GainControl(), maxInputFrames: AVAudioFrameCount = 16_384) throws {
         self.input = input
+        self.gain = gain
+        self.appliedGain = gain.value
         self.maxInputFrames = maxInputFrames
         output = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -50,7 +57,7 @@ public final class PCMConverter {
               let inBuffer = AVAudioPCMBuffer(pcmFormat: input, bufferListNoCopy: list, deallocator: nil)
         else { return }
         inBuffer.frameLength = frames
-        peak = Self.peak(of: buffers, isFloat: input.commonFormat == .pcmFormatFloat32)
+        let inputPeak = Self.peak(of: buffers, isFloat: input.commonFormat == .pcmFormatFloat32)
 
         var fed = false
         outBuffer.frameLength = 0
@@ -65,7 +72,25 @@ public final class PCMConverter {
             return inBuffer
         }
         guard status != .error, outBuffer.frameLength > 0, let data = outBuffer.int16ChannelData else { return }
+        let target = gain.value
+        applyGain(to: data[0], frames: Int(outBuffer.frameLength), target: target)
+        peak = inputPeak * target
         sink(data[0], Int(outBuffer.frameLength) * RelayProtocol.bytesPerFrame)
+    }
+
+    private func applyGain(to samples: UnsafeMutablePointer<Int16>, frames: Int, target: Float) {
+        let start = appliedGain
+        appliedGain = target
+        if start == 1, target == 1 { return }
+        let channels = RelayProtocol.channels
+        let step = (target - start) / Float(frames)
+        for frame in 0..<frames {
+            let g = start + step * Float(frame + 1)
+            for c in 0..<channels {
+                let i = frame * channels + c
+                samples[i] = Int16(clamping: Int((Float(samples[i]) * g).rounded()))
+            }
+        }
     }
 
     private static func peak(of buffers: UnsafeMutableAudioBufferListPointer, isFloat: Bool) -> Float {

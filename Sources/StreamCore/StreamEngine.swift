@@ -17,6 +17,11 @@ import SystemConfiguration
 ///   that was frozen for hours. A frozen socket is what wedged snapserver's tcp source.
 /// - The tap is rebuilt whenever the output device or its format changes, and the
 ///   converter always produces 48 kHz, so the relay never sees a format change.
+/// - A capture that delivers nothing is rebuilt once, then reported and stopped. Before
+///   this, a Mac waiting on the capture-permission prompt reconnected every 4 seconds
+///   indefinitely, toggling its own local mute each time.
+/// - Backoff only resets after sustained healthy streaming, not on every accepted
+///   connection, so no failure mode can retry at full speed forever.
 ///
 /// All state is confined to one serial queue; callbacks arrive on `callbackQueue`.
 public final class StreamEngine {
@@ -65,15 +70,38 @@ public final class StreamEngine {
         public var sourceName: String
         public var token: String?
         public var muteLocal: Bool
+        /// Slider position, 0...1, before the volume curve.
+        public var streamVolume: Float
+        /// Also scale by the Mac's own output volume and mute (its volume keys).
+        public var followSystemVolume: Bool
 
         public init(target: RelayTarget = .automatic, sourceName: String = StreamEngine.defaultSourceName,
-                    token: String? = nil, muteLocal: Bool = true) {
+                    token: String? = nil, muteLocal: Bool = true,
+                    streamVolume: Float = 1, followSystemVolume: Bool = true) {
             self.target = target
             self.sourceName = sourceName
             self.token = token
             self.muteLocal = muteLocal
+            self.streamVolume = streamVolume
+            self.followSystemVolume = followSystemVolume
         }
     }
+
+    public typealias CaptureFactory = (_ muteLocal: Bool, _ queue: DispatchQueue,
+                                       _ onFormatChange: @escaping () -> Void) throws -> AudioCapture
+
+    public static let systemTap: CaptureFactory = { mute, queue, onFormatChange in
+        try SystemAudioTap(muteLocal: mute, queue: queue, onFormatChange: onFormatChange)
+    }
+
+    /// No capture callbacks for this long means the capture is stalled.
+    static var captureStallTimeout: TimeInterval = 2
+    /// Streaming this long without trouble resets the reconnect backoff.
+    static var healthyStreamingDuration: TimeInterval = 10
+
+    static let stallMessage = "This Mac isn't delivering any audio to capture. If macOS is asking for "
+        + "permission to record system audio, allow it and start again; otherwise check System Settings "
+        + "→ Privacy & Security → Screen & System Audio Recording."
 
     public struct Stats {
         public var sentBytes: Int
@@ -89,13 +117,23 @@ public final class StreamEngine {
     private let callbackQueue: DispatchQueue
     private let onStateChange: (State) -> Void
     private let onRelaysChange: ([RelayBrowser.Relay]) -> Void
+    private let onOutputChange: (SystemVolumeWatcher.Info) -> Void
+    private let makeCapture: CaptureFactory
 
     private var config: Configuration
     private var state: State = .idle
     private var wanted = false
     private var resumeAfterWake = false
     private var client: RelayClient?
-    private var tap: SystemAudioTap?
+    private var tap: AudioCapture?
+    private var volumeWatcher: SystemVolumeWatcher?
+    private let gain = GainControl()
+    private let captureTicks = TickCounter()
+    private var watchdog: DispatchSourceTimer?
+    private var lastTicks = 0
+    private var lastProgress = Date()
+    private var streamingSince: Date?
+    private var rebuiltForStall = false
     private var captureFormat: String?
     private var browser: RelayBrowser?
     private var discovered: [RelayBrowser.Relay] = []
@@ -115,12 +153,16 @@ public final class StreamEngine {
         mElement: kAudioObjectPropertyElementMain)
 
     public init(configuration: Configuration, callbackQueue: DispatchQueue = .main,
+                capture: @escaping CaptureFactory = StreamEngine.systemTap,
                 onStateChange: @escaping (State) -> Void,
-                onRelaysChange: @escaping ([RelayBrowser.Relay]) -> Void = { _ in }) {
+                onRelaysChange: @escaping ([RelayBrowser.Relay]) -> Void = { _ in },
+                onOutputChange: @escaping (SystemVolumeWatcher.Info) -> Void = { _ in }) {
         self.config = configuration
         self.callbackQueue = callbackQueue
+        self.makeCapture = capture
         self.onStateChange = onStateChange
         self.onRelaysChange = onRelaysChange
+        self.onOutputChange = onOutputChange
         queue.async { self.setUp() }
     }
 
@@ -148,7 +190,9 @@ public final class StreamEngine {
         queue.async {
             let old = self.config
             self.config = configuration
-            guard old != configuration, self.wanted else { return }
+            guard old != configuration else { return }
+            self.updateGain()
+            guard self.wanted else { return }
             if old.target != configuration.target || old.sourceName != configuration.sourceName
                 || old.token != configuration.token {
                 self.teardown()
@@ -167,7 +211,7 @@ public final class StreamEngine {
     }
 
     /// Which Mac is streaming right now, according to the relay we would connect to.
-    public func queryStatus(completion: @escaping (Result<RelayProtocol.Control, Error>) -> Void) {
+    public func queryStatus(completion: @escaping (Result<RelayClient.StatusResult, Error>) -> Void) {
         queue.async {
             guard let (endpoint, _) = self.resolveTarget() else {
                 struct NoRelay: LocalizedError { var errorDescription: String? { "No relay found." } }
@@ -210,6 +254,22 @@ public final class StreamEngine {
         }
         deviceListener = listener
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &Self.defaultOutputAddress, queue, listener)
+
+        volumeWatcher = SystemVolumeWatcher(queue: queue) { [weak self] info in
+            guard let self else { return }
+            self.updateGain()
+            let cb = self.onOutputChange
+            self.callbackQueue.async { cb(info) }
+        }
+        updateGain()
+    }
+
+    private func updateGain() {
+        var position = config.streamVolume
+        if config.followSystemVolume, let info = volumeWatcher?.info {
+            position *= info.factor
+        }
+        gain.value = VolumeCurve.gain(forPosition: position)
     }
 
     private func willSleep() {
@@ -262,9 +322,11 @@ public final class StreamEngine {
         guard gen == generation else { return }  // from a client we already tore down
         switch event {
         case .welcome:
-            retryAttempt = 0
             do {
                 try startTap()
+                rebuiltForStall = false
+                streamingSince = Date()
+                startWatchdog()
                 set(.streaming(relay: relay, since: Date()))
             } catch {
                 teardown()
@@ -275,6 +337,15 @@ public final class StreamEngine {
             teardown()
             wanted = false
             set(.replaced(by: by))
+        case .relayHeardNothing:
+            let captureHealthy = tap != nil && Date().timeIntervalSince(lastProgress) < 1
+            teardown()
+            if captureHealthy {
+                scheduleRetry(reason: "The connection stalled.")  // network, and it recovered
+            } else {
+                wanted = false
+                set(.failed(Self.stallMessage))
+            }
         case .refused(let reason):
             teardown()
             wanted = false
@@ -302,6 +373,9 @@ public final class StreamEngine {
 
     private func teardown() {
         generation += 1
+        watchdog?.cancel()
+        watchdog = nil
+        streamingSince = nil
         tap?.stop()
         tap = nil
         captureFormat = nil
@@ -313,14 +387,18 @@ public final class StreamEngine {
     // MARK: Tap
 
     private func startTap() throws {
-        let tap = try SystemAudioTap(muteLocal: config.muteLocal, queue: queue) { [weak self] in
+        let tap = try makeCapture(config.muteLocal, queue) { [weak self] in
             guard let self, self.tap != nil else { return }
             self.rebuildTap()
         }
-        let converter = try PCMConverter(input: tap.format)
+        let converter = try PCMConverter(input: tap.format, gain: gain)
         let ring = self.ring
         let meter = self.meter
+        let ticks = captureTicks
+        lastProgress = Date()
+        lastTicks = ticks.value
         try tap.start { list in
+            ticks.increment()
             converter.convert(list) { bytes, count in ring.write(bytes, count) }
             meter.value = converter.peak
         }
@@ -340,12 +418,53 @@ public final class StreamEngine {
         }
     }
 
+    private func startWatchdog() {
+        watchdog?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
+        timer.setEventHandler { [weak self] in self?.checkCapture() }
+        timer.resume()
+        watchdog = timer
+    }
+
+    private func checkCapture() {
+        guard tap != nil else { return }
+        let now = Date()
+        let ticks = captureTicks.value
+        if ticks != lastTicks {
+            lastTicks = ticks
+            lastProgress = now
+            if let since = streamingSince, now.timeIntervalSince(since) > Self.healthyStreamingDuration {
+                retryAttempt = 0
+                rebuiltForStall = false
+            }
+            return
+        }
+        guard now.timeIntervalSince(lastProgress) > Self.captureStallTimeout else { return }
+        if !rebuiltForStall {
+            rebuiltForStall = true
+            rebuildTap()  // one fresh tap first: device changes can leave an old one dead
+        } else {
+            teardown()
+            wanted = false
+            set(.failed(Self.stallMessage))
+        }
+    }
+
     private func set(_ new: State) {
         guard new != state else { return }
         state = new
         let cb = onStateChange
         callbackQueue.async { cb(new) }
     }
+}
+
+/// Incremented on the audio thread, read by the watchdog.
+final class TickCounter {
+    private var lock = os_unfair_lock()
+    private var _value = 0
+    var value: Int { os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }; return _value }
+    func increment() { os_unfair_lock_lock(&lock); _value &+= 1; os_unfair_lock_unlock(&lock) }
 }
 
 /// Written on the audio thread, read by the UI.

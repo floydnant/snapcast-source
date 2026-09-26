@@ -15,13 +15,21 @@ final class AppModel: ObservableObject {
     @Published private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published private(set) var loginItemError: String?
 
+    @Published private(set) var speakers: [SnapcastControl.Speaker] = []
+    @Published private(set) var controlState: SnapcastControl.ConnectionState = .disconnected
+    @Published private(set) var output = SystemVolumeWatcher.Info(deviceName: "", supported: false, scalar: 1, muted: false)
+
     @Published var relayOverride: String { didSet { save(); pushConfig() } }
     @Published var muteLocal: Bool { didSet { save(); pushConfig() } }
     @Published var sourceName: String { didSet { save(); pushConfig() } }
     @Published var token: String { didSet { save(); pushConfig() } }
     @Published var streamOnLaunch: Bool { didSet { save() } }
+    /// Slider position 0...1; the engine applies the volume curve.
+    @Published var streamVolume: Double { didSet { save(); pushConfig() } }
+    @Published var followSystemVolume: Bool { didSet { save(); pushConfig() } }
 
     private var engine: StreamEngine!
+    private var control: SnapcastControl!
     private var levelTimer: Timer?
     private var statusTimer: Timer?
     private let defaults = UserDefaults.standard
@@ -32,11 +40,20 @@ final class AppModel: ObservableObject {
         sourceName = defaults.string(forKey: "sourceName") ?? ""
         token = defaults.string(forKey: "token") ?? ""
         streamOnLaunch = defaults.bool(forKey: "streamOnLaunch")
+        streamVolume = defaults.object(forKey: "streamVolume") as? Double ?? 1
+        followSystemVolume = defaults.object(forKey: "followSystemVolume") as? Bool ?? true
 
         engine = StreamEngine(
             configuration: configuration(),
             onStateChange: { [weak self] in self?.stateChanged($0) },
-            onRelaysChange: { [weak self] in self?.relays = $0 })
+            onRelaysChange: { [weak self] relays in
+                self?.relays = relays
+                self?.pollStatus()  // a relay just appeared: find its speakers now, not in 5s
+            },
+            onOutputChange: { [weak self] in self?.output = $0 })
+        control = SnapcastControl(
+            onSnapshot: { [weak self] in self?.speakers = $0.speakers },
+            onState: { [weak self] in self?.controlState = $0 })
 
         // Scheduled on the main run loop, so the callbacks are already on the main actor.
         statusTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -95,6 +112,15 @@ final class AppModel: ObservableObject {
         }
     }
 
+    var connectedSpeakers: [SnapcastControl.Speaker] { speakers.filter(\.connected) }
+
+    var volumeCaption: String? {
+        guard followSystemVolume, !output.deviceName.isEmpty else { return nil }
+        if !output.supported { return "\(output.deviceName) has no software volume control, so only this slider applies." }
+        if output.muted { return "\(output.deviceName) is muted, so the stream is too." }
+        return "Also follows the volume of \(output.deviceName)."
+    }
+
     var primaryActionTitle: String {
         if isActive { return "Stop Streaming" }
         return activeElsewhere != nil || { if case .replaced = state { return true }; return false }()
@@ -110,6 +136,14 @@ final class AppModel: ObservableObject {
             activeElsewhere = nil
             engine.start()
         }
+    }
+
+    func toggleMute(_ speaker: SnapcastControl.Speaker) {
+        control.setMuted(speaker.id, !speaker.muted)
+    }
+
+    func setVolume(_ speaker: SnapcastControl.Speaker, _ fraction: Double) {
+        control.setVolume(speaker.id, percent: Int((fraction * 100).rounded()))
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -136,7 +170,9 @@ final class AppModel: ObservableObject {
             target: StreamEngine.RelayTarget(relayOverride) ?? .automatic,
             sourceName: effectiveSourceName,
             token: token.isEmpty ? nil : token,
-            muteLocal: muteLocal)
+            muteLocal: muteLocal,
+            streamVolume: Float(streamVolume),
+            followSystemVolume: followSystemVolume)
     }
 
     private func pushConfig() {
@@ -150,6 +186,8 @@ final class AppModel: ObservableObject {
         defaults.set(sourceName, forKey: "sourceName")
         defaults.set(token, forKey: "token")
         defaults.set(streamOnLaunch, forKey: "streamOnLaunch")
+        defaults.set(streamVolume, forKey: "streamVolume")
+        defaults.set(followSystemVolume, forKey: "followSystemVolume")
     }
 
     private func stateChanged(_ new: StreamEngine.State) {
@@ -180,15 +218,22 @@ final class AppModel: ObservableObject {
         level = 0
     }
 
+    /// Runs whether or not we are streaming: the answer also says where snapserver's
+    /// control port is, which the speaker controls need either way.
     private func pollStatus() {
-        guard !isActive else { return }
         engine.queryStatus { [weak self] result in
             Task { @MainActor in
-                guard let self, !self.isActive else { return }
-                if case .success(let status) = result, let active = status.active, active != self.effectiveSourceName {
-                    self.activeElsewhere = active
-                } else {
-                    self.activeElsewhere = nil
+                guard let self else { return }
+                guard case .success(let r) = result else {
+                    if !self.isActive { self.activeElsewhere = nil }
+                    return
+                }
+                if !self.isActive {
+                    let active = r.status.active
+                    self.activeElsewhere = (active != nil && active != self.effectiveSourceName) ? active : nil
+                }
+                if let port = r.status.control, port > 0, let host = r.host {
+                    self.control.connect(host: host, port: UInt16(port))
                 }
             }
         }

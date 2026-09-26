@@ -11,8 +11,18 @@ public final class RelayClient {
     public enum Event: Equatable {
         case welcome
         case replaced(by: String)
+        /// The relay dropped us for sending no audio on a connection that stayed up.
+        /// Either our capture stalled, or the network did and has recovered; only the
+        /// engine knows which.
+        case relayHeardNothing
         case refused(String)
         case failed(String)
+    }
+
+    public struct StatusResult {
+        public var status: RelayProtocol.Control
+        /// The relay's address as actually connected to, e.g. resolved from Bonjour.
+        public var host: NWEndpoint.Host?
     }
 
     public static let pingTimeout: TimeInterval = 3
@@ -44,7 +54,7 @@ public final class RelayClient {
         self.onEvent = onEvent
     }
 
-    static func parameters() -> NWParameters {
+    static func parameters(ipv4Only: Bool = false) -> NWParameters {
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
         tcp.connectionTimeout = 5
@@ -52,7 +62,11 @@ public final class RelayClient {
         tcp.keepaliveIdle = 5
         tcp.keepaliveInterval = 2
         tcp.keepaliveCount = 3
-        return NWParameters(tls: nil, tcp: tcp)
+        let params = NWParameters(tls: nil, tcp: tcp)
+        if ipv4Only, let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ip.version = .v4
+        }
+        return params
     }
 
     /// Must be called on `queue`.
@@ -138,6 +152,8 @@ public final class RelayClient {
             break
         case "replaced":
             finish(.replaced(by: message.by ?? "another Mac"))
+        case "error" where message.code == RelayProtocol.noAudioCode:
+            finish(.relayHeardNothing)
         case "error":
             finish(.refused(message.reason ?? "Relay refused the connection."))
         default:
@@ -172,13 +188,13 @@ public final class RelayClient {
         if let event { onEvent(event) }
     }
 
-    static func describe(_ error: Error) -> String {
+    static func describe(_ error: Error, service: String = "Relay") -> String {
         if let nw = error as? NWError {
             switch nw {
-            case .posix(.ECONNREFUSED): return "Relay is not running (connection refused)."
-            case .posix(.ETIMEDOUT): return "Relay did not answer (timed out)."
-            case .posix(.EHOSTUNREACH), .posix(.ENETUNREACH): return "Relay is unreachable."
-            case .dns: return "Relay host name could not be resolved."
+            case .posix(.ECONNREFUSED): return "\(service) is not running (connection refused)."
+            case .posix(.ETIMEDOUT): return "\(service) did not answer (timed out)."
+            case .posix(.EHOSTUNREACH), .posix(.ENETUNREACH): return "\(service) is unreachable."
+            case .dns: return "\(service) host name could not be resolved."
             default: return nw.localizedDescription
             }
         }
@@ -188,13 +204,28 @@ public final class RelayClient {
     // MARK: - Status query
 
     /// Asks a relay which source is currently streaming, without disturbing it.
+    ///
+    /// Tries IPv4 first. The host this resolves to is also where the app reaches
+    /// snapserver's control port, and snapserver listens on IPv4 only by default; over
+    /// Bonjour, the relay (which listens dual-stack) otherwise tends to resolve to IPv6.
     public static func queryStatus(endpoint: NWEndpoint, token: String?, queue: DispatchQueue,
-                                   completion: @escaping (Result<RelayProtocol.Control, Error>) -> Void) {
+                                   completion: @escaping (Result<StatusResult, Error>) -> Void) {
+        queryStatusOnce(endpoint: endpoint, token: token, queue: queue, ipv4Only: true) { result in
+            if case .failure = result {
+                queryStatusOnce(endpoint: endpoint, token: token, queue: queue, ipv4Only: false, completion: completion)
+            } else {
+                completion(result)
+            }
+        }
+    }
+
+    private static func queryStatusOnce(endpoint: NWEndpoint, token: String?, queue: DispatchQueue, ipv4Only: Bool,
+                                        completion: @escaping (Result<StatusResult, Error>) -> Void) {
         struct QueryError: LocalizedError { let errorDescription: String? }
-        let connection = NWConnection(to: endpoint, using: parameters())
+        let connection = NWConnection(to: endpoint, using: parameters(ipv4Only: ipv4Only))
         var parser = ControlLineParser()
         var done = false
-        func complete(_ result: Result<RelayProtocol.Control, Error>) {
+        func complete(_ result: Result<StatusResult, Error>) {
             guard !done else { return }
             done = true
             connection.cancel()
@@ -206,7 +237,9 @@ public final class RelayClient {
                     if first.type == "error" {
                         complete(.failure(QueryError(errorDescription: first.reason)))
                     } else {
-                        complete(.success(first))
+                        var host: NWEndpoint.Host?
+                        if case .hostPort(let h, _)? = connection.currentPath?.remoteEndpoint { host = h }
+                        complete(.success(StatusResult(status: first, host: host)))
                     }
                 } else if let error {
                     complete(.failure(error))

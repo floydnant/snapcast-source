@@ -1,10 +1,12 @@
 #!/bin/sh
-# Runs ON the server (make deploy-relay copies it to /tmp and runs it). No root needed.
+# Runs ON the server: make deploy-relay stages it next to the binary and runs it.
+# No root needed.
 set -eu
+STAGE=$(cd "$(dirname "$0")" && pwd)
 
 mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user"
-install -m 0755 /tmp/snapcast-relay "$HOME/.local/bin/snapcast-relay"
-install -m 0644 /tmp/snapcast-relay.service "$HOME/.config/systemd/user/snapcast-relay.service"
+install -m 0755 "$STAGE/snapcast-relay" "$HOME/.local/bin/snapcast-relay"
+install -m 0644 "$STAGE/snapcast-relay.service" "$HOME/.config/systemd/user/snapcast-relay.service"
 
 systemctl --user daemon-reload
 systemctl --user enable snapcast-relay.service >/dev/null 2>&1
@@ -23,4 +25,4 @@ fi
 
 sleep 1
 systemctl --user --no-pager --lines=5 status snapcast-relay.service || true
-rm -f /tmp/snapcast-relay /tmp/snapcast-relay.service /tmp/install-relay.sh
+rm -rf "$STAGE"

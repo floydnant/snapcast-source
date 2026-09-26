@@ -53,9 +53,30 @@ The Mac that was replaced shows "*Mac B* took over" and stays stopped until you 
 **Take Over**. It never grabs the stream back by itself, which would have two Macs
 fighting over it forever. While you're not streaming, the menu shows which Mac is.
 
+**Volume.** The slider sets the stream's volume. By default the stream also follows this
+Mac's own volume and mute, so the volume keys keep working while local output is muted.
+That needs doing explicitly: the tap captures what apps play *before* the output device
+applies its volume. Audio interfaces with only a hardware knob have no software volume;
+for those, the slider is the only control.
+
+**Speakers.** The menu lists the Snapcast speakers with mute and volume, through
+snapserver's own control API (the one Snapweb uses). The relay tells the app where that
+is, so there is still nothing to configure.
+
+**Automatic source switching.** The relay moves your Snapcast groups to whichever source
+started most recently. Start streaming from a Mac, and the speakers switch to the Mac.
+Start AirPlaying from a phone, and they switch to AirPlay. When the newer one stops,
+they go back to the other; with neither active, they settle on AirPlay. Groups on any
+other stream are left alone, and a change you make by hand in Snapweb is not undone until
+something new starts or stops. A Mac that drops out briefly (WiFi, sleep, a relay
+restart) has 8 seconds to come back before anything switches. Flags: `-auto-switch`,
+`-mac-stream`, `-fallback-stream`, `-switch-grace`.
+
 **It looks after itself.** The app reconnects with backoff if the relay or the network
 goes away, tears down on sleep and resumes on wake, and rebuilds capture when you switch
-output devices.
+output devices. If capture stops delivering audio (for example while macOS is showing
+the permission prompt), it rebuilds the tap once, then stops and says why instead of
+retrying forever.
 
 ## How it works, and why
 
@@ -108,6 +129,8 @@ snapstream tap-test --seconds 5     # capture + convert only: frames/s should be
 snapstream browse                   # relays found over Bonjour
 snapstream status                   # which Mac is streaming right now
 snapstream stream --no-mute         # stream from the terminal
+snapstream speakers                 # speakers, volumes and streams, via snapserver
+snapstream speaker-volume ID 40     # set a speaker's volume (--mute / --unmute)
 ```
 
 `--relay host[:port]` (or `$SNAPSTREAM_RELAY`) skips discovery.
@@ -155,3 +178,6 @@ and an ad-hoc signature changes on every build, so it asks again after each rebu
   have an audio-offset control.
 - **Excluding apps isn't exposed yet.** The tap captures everything the Mac plays, alert
   sounds included.
+- **Snapserver's control port must accept IPv4.** It does by default. The app tries
+  IPv4 first because snapserver listens there, while Bonjour otherwise often resolves the
+  relay to IPv6.

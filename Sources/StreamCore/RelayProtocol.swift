@@ -42,12 +42,18 @@ public enum RelayProtocol {
 
     public struct Control: Codable, Equatable {
         public var type: String
+        public var code: String?
         public var by: String?
         public var reason: String?
         public var active: String?
         public var since: Int64?
         public var format: String?
+        /// Snapserver's JSON-RPC port on the relay's host, if the relay advertises it.
+        public var control: Int?
     }
+
+    /// `code` on an "error" when the relay dropped us for sending no audio.
+    public static let noAudioCode = "no_audio"
 }
 
 /// Splits a byte stream into newline-delimited control messages.

@@ -2,6 +2,13 @@ import AVFoundation
 import AudioToolbox
 import CoreAudio
 
+/// Anything that can feed the engine audio. The system tap in production; a fake in tests.
+public protocol AudioCapture: AnyObject {
+    var format: AVAudioFormat { get }
+    func start(_ handler: @escaping (UnsafePointer<AudioBufferList>) -> Void) throws
+    func stop()
+}
+
 /// Captures the mixdown of everything the Mac is playing, via a CoreAudio process tap
 /// (macOS 14.2+). No virtual audio driver involved.
 ///
@@ -14,7 +21,7 @@ import CoreAudio
 ///
 /// Both the tap and the aggregate are private, so they are invisible to other apps and
 /// die with this process: a crash cannot leave the Mac muted.
-public final class SystemAudioTap {
+public final class SystemAudioTap: AudioCapture {
     public enum TapError: LocalizedError {
         case createTap(OSStatus)
         case readFormat(OSStatus)

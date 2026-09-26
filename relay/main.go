@@ -28,9 +28,23 @@ func main() {
 	flag.DurationVar(&cfg.ReadTimeout, "read-timeout", cfg.ReadTimeout, "drop a source after this long without audio")
 	host, _ := os.Hostname()
 	mdnsName := flag.String("mdns-name", "Snapcast on "+host, "name advertised over mDNS")
+	snapserver := flag.String("snapserver", "127.0.0.1:1705", "snapserver JSON-RPC address, for switching groups and for the app's speaker controls")
+	autoSwitch := flag.Bool("auto-switch", true, "move groups to whichever source started most recently")
+	macStream := flag.String("mac-stream", "Mac", "id of the snapserver stream this relay feeds")
+	fallbackStream := flag.String("fallback-stream", "AirPlay", "stream groups return to when no Mac is streaming")
+	grace := flag.Duration("switch-grace", 8*time.Second, "how long a Mac may be gone before groups return to the fallback")
+	controlPort := flag.Int("control-port", -1, "snapserver JSON-RPC port to advertise to the app (default: the -snapserver port; 0 hides it)")
 	noMDNS := flag.Bool("no-mdns", false, "do not advertise over mDNS")
 	flag.Parse()
 	log.SetFlags(0) // journald timestamps it
+
+	if *controlPort < 0 {
+		*controlPort = 0
+		if _, p, err := net.SplitHostPort(*snapserver); err == nil {
+			*controlPort, _ = strconv.Atoi(p)
+		}
+	}
+	cfg.ControlPort = *controlPort
 
 	// Create the FIFO before binding the port. If the port is still taken (snapserver's
 	// old tcp:// source during migration), this process exits and systemd retries — but
@@ -48,10 +62,15 @@ func main() {
 
 	r := NewRelay(cfg)
 	stop := make(chan struct{})
+	if *autoSwitch {
+		sw := NewSwitcher(*snapserver, *macStream, *fallbackStream, *grace)
+		r.OnActiveChange = sw.SetMacActive
+		go sw.Run(stop)
+	}
 	go r.RunSink(func() (io.WriteCloser, error) { return openFIFO(*fifo) }, stop)
 	go r.Serve(ln)
 	if !*noMDNS {
-		go advertise(*mdnsName, port, cfg.Format, stop)
+		go advertise(*mdnsName, port, cfg.Format, cfg.ControlPort, stop)
 	}
 	go logStats(r, stop)
 
@@ -140,14 +159,18 @@ func inode(path string) (uint64, error) {
 // advertise publishes the relay via avahi's CLI rather than an mDNS library: the host
 // already runs avahi-daemon (for shairport-sync), and a second responder on the same
 // machine would fight it over port 5353.
-func advertise(name string, port int, format string, stop <-chan struct{}) {
+func advertise(name string, port int, format string, control int, stop <-chan struct{}) {
 	bin, err := exec.LookPath("avahi-publish-service")
 	if err != nil {
 		log.Printf("mdns: avahi-publish-service not found, not advertising")
 		return
 	}
 	for {
-		cmd := exec.Command(bin, name, ServiceType, strconv.Itoa(port), "format="+format, "proto=1")
+		txt := []string{"format=" + format, "proto=1"}
+		if control > 0 {
+			txt = append(txt, "control="+strconv.Itoa(control))
+		}
+		cmd := exec.Command(bin, append([]string{name, ServiceType, strconv.Itoa(port)}, txt...)...)
 		if err := cmd.Start(); err != nil {
 			log.Printf("mdns: %v", err)
 		} else {

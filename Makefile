@@ -76,8 +76,11 @@ deploy-relay: relay
 ifeq ($(strip $(SSH_HOST)),)
 	$(error SSH_HOST is not set. Set it in .env, or run: make deploy-relay SSH_HOST=your-server)
 endif
-	scp build/snapcast-relay deploy/snapcast-relay.service deploy/install-relay.sh $(SSH_HOST):/tmp/
-	ssh $(SSH_HOST) 'sh /tmp/install-relay.sh'
+	@# Staged in a private directory, not /tmp: a file at /tmp/snapcast-relay once
+	@# collided with the relay's own FIFO directory of the same name.
+	ssh $(SSH_HOST) 'mkdir -p .cache/snapcast-relay-install'
+	scp build/snapcast-relay deploy/snapcast-relay.service deploy/install-relay.sh $(SSH_HOST):.cache/snapcast-relay-install/
+	ssh $(SSH_HOST) 'sh .cache/snapcast-relay-install/install-relay.sh'
 
 ## Legacy path: capture a BlackHole device with snapcap and pipe it to the relay.
 stream: build

@@ -4,6 +4,8 @@
 
 # Built app bundle and cross-compiled relay.
 /build/
+# What `go build` leaves behind when run inside relay/.
+/relay/relay
 
 # Local machine/network settings. See .env.example.
 .env

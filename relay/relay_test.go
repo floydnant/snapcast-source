@@ -273,3 +273,50 @@ func TestSinkStallDropsInsteadOfBlocking(t *testing.T) {
 		t.Fatal("expected drops with a stalled sink")
 	}
 }
+
+func TestSilentSourceIsToldWhy(t *testing.T) {
+	_, _, addr := start(t, nil)
+	c := dial(t, addr)
+	c.hello(Hello{Name: "Mac A", Format: "48000:16:2"})
+	c.expect("welcome")
+	// Send nothing, as a Mac whose capture stalled would. It must learn that the
+	// problem is its audio, not the network, so it can stop instead of retrying.
+	if m := c.expect("error"); m.Code != NoAudioCode || m.Reason != NoAudioReason {
+		t.Fatalf("got %+v", m)
+	}
+}
+
+func TestStatusQueriesDoNotConsumeSessionIDs(t *testing.T) {
+	r, _, addr := start(t, nil)
+	for i := 0; i < 5; i++ {
+		q := dial(t, addr)
+		q.hello(Hello{Mode: "status"})
+		q.expect("status")
+	}
+	a := dial(t, addr)
+	a.hello(Hello{Name: "Mac A", Format: "48000:16:2"})
+	a.expect("welcome")
+	if id := r.nextID.Load(); id != 1 {
+		t.Fatalf("first streaming session got id %d after 5 status polls, want 1", id)
+	}
+}
+
+func TestActiveChangeHook(t *testing.T) {
+	var mu sync.Mutex
+	var events []bool
+	r, _, addr := start(t, nil)
+	r.OnActiveChange = func(a bool) { mu.Lock(); events = append(events, a); mu.Unlock() }
+	got := func() []bool { mu.Lock(); defer mu.Unlock(); return append([]bool(nil), events...) }
+
+	a := dial(t, addr)
+	a.hello(Hello{Name: "Mac A", Format: "48000:16:2"})
+	a.expect("welcome")
+	b := dial(t, addr)
+	b.hello(Hello{Name: "Mac B", Format: "48000:16:2"})
+	b.expect("welcome")
+	b.conn.Close()
+	eventually(t, "start, takeover, end", func() bool {
+		e := got()
+		return len(e) == 3 && e[0] && e[1] && !e[2]
+	})
+}

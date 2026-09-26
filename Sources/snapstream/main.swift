@@ -3,11 +3,14 @@
 //   snapstream tap-test [--seconds N] [--mute]     capture + convert only, report rates
 //   snapstream browse [--seconds N]                list relays found over Bonjour
 //   snapstream status [--relay HOST[:PORT]]        which Mac is streaming right now
-//   snapstream stream [--relay HOST[:PORT]] [--name NAME] [--no-mute] [--seconds N]
+//   snapstream stream [--relay HOST[:PORT]] [--name NAME] [--no-mute] [--volume 0-1] [--seconds N]
+//   snapstream speakers [--relay HOST[:PORT]]      speakers, via snapserver's control port
+//   snapstream speaker-volume ID PERCENT [--mute | --unmute] [--relay HOST[:PORT]]
 //
 // `--relay` defaults to $SNAPSTREAM_RELAY, then to automatic discovery.
 
 import Foundation
+import Network
 import StreamCore
 
 setvbuf(stdout, nil, _IOLBF, 0)
@@ -41,6 +44,9 @@ func onInterrupt(_ handler: @escaping () -> Void) {
     }
 }
 var interruptSources: [DispatchSourceSignal] = []
+var verifiers: [SnapcastControl] = []
+var controlHost: NWEndpoint.Host?
+var controlPort: UInt16?
 
 func describe(_ state: StreamEngine.State) -> String {
     switch state {
@@ -103,8 +109,11 @@ case "status":
     DispatchQueue.main.asyncAfter(deadline: .now() + (target == .automatic ? 2 : 0)) {
         engine.queryStatus { result in
             switch result {
-            case .success(let s):
+            case .success(let r):
+                let s = r.status
                 print(s.active.map { "active: \($0) since \(Date(timeIntervalSince1970: TimeInterval(s.since ?? 0)))" } ?? "active: nobody")
+                print("control: \(s.control.map { "port \($0)" } ?? "not advertised (relay predates speaker controls)")"
+                    + (r.host.map { " on \($0)" } ?? ""))
                 exit(0)
             case .failure(let e):
                 die(e.localizedDescription)
@@ -115,6 +124,7 @@ case "status":
 
 case "stream":
     var config = StreamEngine.Configuration(target: target, token: token, muteLocal: !flag("--no-mute"))
+    if let v = option("--volume").flatMap(Float.init) { config.streamVolume = v }
     if let name = option("--name") { config.sourceName = name }
     let engine = StreamEngine(configuration: config, onStateChange: { print("state: \(describe($0))") })
     engine.start()
@@ -137,13 +147,76 @@ case "stream":
     onInterrupt { finish() }
     dispatchMain()
 
+case "speakers", "speaker-volume":
+    // Resolve the relay, ask it for snapserver's control port, then talk to snapserver.
+    let engine = StreamEngine(configuration: .init(target: target, token: token), onStateChange: { _ in })
+    var control: SnapcastControl!
+    var acted = false
+    control = SnapcastControl(onSnapshot: { snap in
+        if command == "speakers" {
+            for sp in snap.speakers {
+                let name = sp.name.padding(toLength: max(sp.name.count, 16), withPad: " ", startingAt: 0)
+                let volume = "\(sp.percent)%".padding(toLength: 5, withPad: " ", startingAt: 0)
+                print("\(name) \(volume)\(sp.muted ? "muted" : "     ")  stream=\(sp.streamID)"
+                      + "\(sp.connected ? "" : "  (disconnected)")  id=\(sp.id)")
+            }
+            print("streams: " + snap.streams.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
+            exit(0)
+        }
+        // speaker-volume: act once on the first snapshot, then report the next one.
+        let id = args.count > 0 ? args[0] : ""
+        guard let sp = snap.speakers.first(where: { $0.id == id }) else { die("no speaker with id \(id)") }
+        if !acted {
+            acted = true
+            guard args.count > 1, let pct = Int(args[1]) else { die("usage: speaker-volume ID PERCENT") }
+            control.setVolume(id, percent: pct)
+            if flag("--mute") { control.setMuted(id, true) }
+            if flag("--unmute") { control.setMuted(id, false) }
+            // Re-read from the server to prove the change landed, not just the optimistic copy.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                control.disconnect()
+                let verify = SnapcastControl(onSnapshot: { s in
+                    if let v = s.speakers.first(where: { $0.id == id }) {
+                        print("\(v.name): server now reports \(v.percent)%\(v.muted ? " muted" : "")")
+                        exit(0)
+                    }
+                })
+                verifiers.append(verify)
+                verify.connect(host: controlHost!, port: controlPort!)
+            }
+        } else {
+            _ = sp
+        }
+    }, onState: { state in
+        if case .failed(let reason) = state { die(reason) }
+    })
+    DispatchQueue.main.asyncAfter(deadline: .now() + (target == .automatic ? 2 : 0)) {
+        engine.queryStatus { result in
+            switch result {
+            case .success(let r):
+                guard let port = r.status.control, port > 0, let host = r.host else {
+                    die("relay does not advertise snapserver's control port")
+                }
+                controlHost = host
+                controlPort = UInt16(port)
+                control.connect(host: host, port: UInt16(port))
+            case .failure(let e):
+                die(e.localizedDescription)
+            }
+        }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10) { die("timed out") }
+    dispatchMain()
+
 default:
     print("""
     usage:
       snapstream tap-test [--seconds N] [--mute]
       snapstream browse [--seconds N]
       snapstream status [--relay HOST[:PORT]]
-      snapstream stream [--relay HOST[:PORT]] [--name NAME] [--no-mute] [--seconds N]
+      snapstream stream [--relay HOST[:PORT]] [--name NAME] [--no-mute] [--volume 0-1] [--seconds N]
+      snapstream speakers [--relay HOST[:PORT]]
+      snapstream speaker-volume ID PERCENT [--mute | --unmute] [--relay HOST[:PORT]]
     """)
     exit(command == "help" ? 0 : 1)
 }
