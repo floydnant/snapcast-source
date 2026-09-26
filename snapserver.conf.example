@@ -1,12 +1,16 @@
-# The tcp:// source this project feeds, shown in context.
+# The source the relay feeds, shown in context.
 #
-# Note it is an extra `source =` line inside the EXISTING [stream] section. A second
+# It is an extra `source =` line inside the EXISTING [stream] section. A second
 # [stream] header would also re-scope buffer/chunk_ms/codec and can silently change
 # the streams already defined above it.
+#
+# mode=read: the relay creates the FIFO, snapserver only reads it. The FIFO lives in
+# /tmp/snapcast-relay/, which must be visible inside the snapserver container (this
+# setup bind-mounts the host's /tmp).
 
 [stream]
 source = pipe:///tmp/shairport-sync-audio?name=AirPlay&mode=read&sampleformat=44100:16:2
-source = tcp://0.0.0.0:4953?name=Mac&mode=server&sampleformat=48000:16:2&codec=pcm&chunk_ms=10
+source = pipe:///tmp/snapcast-relay/audio.fifo?name=Mac&mode=read&sampleformat=48000:16:2&codec=pcm&chunk_ms=10
 buffer = 1000
 chunk_ms = 10
 codec = pcm

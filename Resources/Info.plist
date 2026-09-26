@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.floydnant.SnapcastSource</string>
+	<key>CFBundleName</key>
+	<string>Snapcast Source</string>
+	<key>CFBundleDisplayName</key>
+	<string>Snapcast Source</string>
+	<key>CFBundleExecutable</key>
+	<string>SnapcastSource</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.2</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Snapcast Source captures what this Mac plays so it can stream it to your Snapcast speakers.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Snapcast Source finds and streams to the Snapcast relay on your local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_snapcast-src._tcp</string>
+	</array>
+</dict>
+</plist>

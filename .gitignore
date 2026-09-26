@@ -2,5 +2,8 @@
 .swiftpm/
 .DS_Store
 
+# Built app bundle and cross-compiled relay.
+/build/
+
 # Local machine/network settings. See .env.example.
 .env

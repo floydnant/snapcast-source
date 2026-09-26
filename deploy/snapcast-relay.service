@@ -1,0 +1,15 @@
+# systemd USER unit: installed to ~/.config/systemd/user/, no root needed.
+[Unit]
+Description=Snapcast source relay (Macs -> FIFO -> snapserver pipe:// source)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/snapcast-relay -listen :4953 -fifo /tmp/snapcast-relay/audio.fifo
+Restart=always
+# Also covers the one ordering hazard at install time: until snapserver is restarted
+# without its old tcp:// source, that source still holds port 4953, and this just
+# retries every few seconds until the port frees up.
+RestartSec=3
+
+[Install]
+WantedBy=default.target

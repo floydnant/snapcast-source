@@ -1,101 +1,157 @@
 # snapcast-source
 
-Streams macOS system audio straight into Snapcast, bypassing AirPlay.
-
-Replaces a shairport-sync/AirPlay feed into snapserver, which added multi-second and
-sometimes wildly variable latency (observed up to ~8s) on top of Snapcast's own buffer.
-This path is a fixed ~300-450ms instead, and does not renegotiate mid-stream.
+Streams a Mac's system audio into Snapcast. A menu bar app on the Mac and a small relay
+on the Snapcast server. No virtual audio driver, no AirPlay, no IP addresses to configure.
 
 ```
-macOS app -> BlackHole (virtual output) -> snapcap -> TCP -> snapserver tcp:// source -> clients
+Mac A: Snapcast Source.app ─┐
+                            ├─► snapcast-relay ──► FIFO ──► snapserver pipe:// ──► speakers
+Mac B: Snapcast Source.app ─┘   (one TCP port,
+                                 found via Bonjour)
 ```
 
-## Build and run
+Replaces an AirPlay/shairport-sync feed, which added multi-second and sometimes wildly
+variable latency (observed up to ~8s) on top of Snapcast's own buffer. This path is fixed
+at snapserver's `buffer` plus a few tens of milliseconds, and does not renegotiate.
+
+## Setup
+
+**Server** (one time). From the Mac:
 
 ```sh
-cp .env.example .env   # then set SERVER to your snapserver host
-make build
-make stream
+cp .env.example .env        # set SERVER, and SSH_HOST if your ssh alias differs
+make deploy-relay
 ```
 
-`SERVER`, `PORT` and `DEVICE` come from `.env`, which is gitignored so no host or IP
-is committed. Anything on the command line overrides it:
+This installs `snapcast-relay` as a systemd **user** service: no root needed. It enables
+lingering so the relay starts at boot, and advertises itself over mDNS through the
+server's existing avahi-daemon.
 
-```sh
-make stream SERVER=192.168.1.50 DEVICE="BlackHole 2ch"
-```
-
-Or by hand, without make:
-
-```sh
-snapcap "BlackHole 16ch" | nc your-snapserver 4953
-```
-
-`make devices` lists device names in the exact form `snapcap` expects. Set BlackHole as
-the system output device so apps play into it.
-
-## Server side
-
-`snapserver.conf` needs a `tcp://` source — see `snapserver.conf.example`. It must be an
-additional `source =` line **inside the existing `[stream]` section**, not a second
-`[stream]` block: `buffer`, `chunk_ms` and `codec` are section-scoped, so a second section
-header can override them for the streams already defined.
-
-`sampleformat` must match what snapcap prints on startup. snapcap uses the device's own
-rate and does not resample, so if you change BlackHole's rate in Audio MIDI Setup, change
-it here too.
-
-Restart to pick up config changes (this briefly drops all connected clients):
+Then add the relay's source to `snapserver.conf` (see `snapserver.conf.example`) and
+restart snapserver:
 
 ```sh
 sudo docker restart snapserver
 ```
 
-## Latency tuning
-
-`buffer` in `snapserver.conf` dominates, and defaults to **1000ms**. 400 is comfortable on
-wired or decent WiFi; 250-300 works if clients are wired. It is a **global** setting, so
-lowering it also changes any AirPlay stream you kept alongside this one.
-
-`codec = pcm` adds no codec latency at ~1.5 Mbit/s per stream. `flac` roughly halves the
-bandwidth for ~26ms.
-
-## Why not ffmpeg
-
-The obvious version of this is one ffmpeg command, and it does not work:
+**Each Mac** (macOS 14.2 or later):
 
 ```sh
-# Broken: drops ~15% of samples, sounds like constant breakup.
-ffmpeg -f avfoundation -i ":BlackHole 16ch" -ar 48000 -ac 2 -f s16le tcp://...
+make install                # builds, signs, copies to ~/Applications, opens it
 ```
 
-ffmpeg's avfoundation input delivers 512-frame buffers at a fixed ~80 per second, capping
-it at **40,960 frames/s** regardless of `-ar`. 48 kHz needs 93.75 buffers/s and 44.1 kHz
-needs 86.1, so every normal rate starves. Measured here over 15s:
+The first time you start streaming, macOS asks for permission to capture system audio.
 
-| capture path                     | frames/s delivered | loss   |
-|----------------------------------|--------------------|--------|
-| ffmpeg avfoundation, BlackHole   | 40,945             | -15.4% |
-| ffmpeg avfoundation, built-in mic| 39,936             | -17.1% |
-| snapcap (CoreAudio HAL)          | 48,000             | none   |
+## Using it
 
-The microphone result rules out BlackHole and the 16-channel width as causes — it is the
-avfoundation path itself. `-thread_queue_size` makes no difference. Lowering the rate to
-44.1 kHz does not help either, which is worth knowing because it is the intuitive first
-guess when this sounds broken.
+Click the speaker in the menu bar, then **Start Streaming**. The app finds the relay by
+itself. What you hear on this Mac moves to your Snapcast speakers; this Mac is muted while
+streaming unless you untick **Mute this Mac while streaming**.
 
-Over a 40s run snapcap's only shortfall is a fixed ~0.2-0.5s of device-open cost at
-startup, which does not accumulate.
+**Several Macs.** Any Mac can take over the stream at any time, and the newest one wins.
+The Mac that was replaced shows "*Mac B* took over" and stays stopped until you press
+**Take Over**. It never grabs the stream back by itself, which would have two Macs
+fighting over it forever. While you're not streaming, the menu shows which Mac is.
 
-## Known trade-offs vs AirPlay
+**It looks after itself.** The app reconnects with backoff if the relay or the network
+goes away, tears down on sleep and resumes on wake, and rebuilds capture when you switch
+output devices.
 
-- **No metadata.** A raw PCM stream carries no track titles, so Snapweb shows none. Would
-  need a snapserver `controlscript` scraping macOS Now Playing, and Apple has been
-  progressively restricting the MediaRemote API those tools rely on.
-- **No system volume.** With BlackHole as output, the Mac's volume keys have nothing to
-  act on. Use per-client volume in Snapweb.
-- **A/V sync.** ~400ms of audio delay is very visible on video. IINA and VLC both have an
-  audio-offset control; otherwise keep AirPlay around for video.
-- **Microphone permission.** macOS counts capturing from any audio device as microphone
-  access, so the terminal running snapcap needs a grant under
-  System Settings -> Privacy & Security -> Microphone.
+## How it works, and why
+
+**No audio driver.** Since macOS 14.2, a CoreAudio *process tap* can capture the mixdown
+of everything the Mac plays, with no driver installed. `CATapMuteBehavior.mutedWhenTapped`
+silences the local output while capturing. That was the only reason to route audio into
+BlackHole in the first place. The tap and its capture device are private to the app and
+die with it, so a crash cannot leave the Mac muted.
+
+The capture device contains **only** the tap. The common recipe also adds the output
+device as a clock source, but an audio interface with inputs then puts its own input
+channels in the same buffer as the tap: measured with a Scarlett 8i6, `10ch + 2ch`.
+
+The alternatives, and why this project doesn't use them: a DriverKit audio extension
+needs an entitlement Apple grants per developer team on request. A HAL plugin (what
+BlackHole is) needs an admin installer and a `coreaudiod` restart.
+
+**One fixed format.** Everything is resampled on the Mac to 48000:16:2, whatever the
+hardware is doing. A Snapcast stream's `sampleformat` is fixed at config time, while a
+tap's format follows the output device: plugging in a 44.1 kHz interface would otherwise
+break the stream.
+
+**A relay instead of snapserver's `tcp://` source.** That source accepts one connection,
+and cannot tell when its peer has gone. A Mac that sleeps or drops off WiFi mid-stream
+leaves it holding a dead socket. Every later connection then queues behind it forever,
+until snapserver is restarted: everything looks connected, and nothing plays. The relay
+owns connection lifecycle instead:
+
+- Sources send continuous audio, so 3s of silence on the socket means the source is gone.
+- The relay pings every second, so the app knows within 3s when the relay is gone.
+- Newest connection wins, and the previous source is told who replaced it.
+- snapserver reads a FIFO that always exists, so its source never wedges.
+- Only whole frames are forwarded. A source that disconnects mid-frame would otherwise
+  shift the next source's audio by a byte, which plays as full-scale noise.
+
+The wire protocol is documented at the top of `relay/relay.go`.
+
+## Latency
+
+`buffer` in `snapserver.conf` dominates. It defaults to **1000 ms**: 400 is comfortable on
+wired or decent WiFi, and 250–300 works if clients are wired. It is a **global** setting,
+so it also changes the AirPlay stream.
+
+## Command-line tools
+
+`snapstream` drives the same pipeline headlessly:
+
+```sh
+snapstream tap-test --seconds 5     # capture + convert only: frames/s should be ~48000
+snapstream browse                   # relays found over Bonjour
+snapstream status                   # which Mac is streaming right now
+snapstream stream --no-mute         # stream from the terminal
+```
+
+`--relay host[:port]` (or `$SNAPSTREAM_RELAY`) skips discovery.
+
+`snapcap` is the original tool. It captures a named CoreAudio device, such as BlackHole,
+and writes raw PCM to stdout. The relay still accepts that as a raw stream:
+
+```sh
+make stream                         # snapcap "$DEVICE" | nc $SERVER $PORT
+```
+
+### Why not ffmpeg
+
+ffmpeg's avfoundation input delivers 512-frame buffers at a fixed ~80/s, capping it at
+**40,960 frames/s** whatever `-ar` says. Every normal rate starves:
+
+| capture path                      | frames/s delivered | loss   |
+|-----------------------------------|--------------------|--------|
+| ffmpeg avfoundation, BlackHole    | 40,945             | -15.4% |
+| ffmpeg avfoundation, built-in mic | 39,936             | -17.1% |
+| snapcap (CoreAudio HAL)           | 48,000             | none   |
+
+## Security
+
+The relay accepts any source on the LAN. To require a shared secret, set `SNAPSRC_TOKEN`
+in the relay's environment (for example with a systemd drop-in) and the same token under
+Settings in the app. Setting a token also disables raw mode.
+
+## Development
+
+```sh
+make test         # Swift unit tests + relay tests under the race detector
+make run          # build the app bundle and launch it
+```
+
+The Makefile signs with a Developer ID or Apple Development certificate if one is in your
+keychain, and ad-hoc otherwise. macOS ties the audio-capture permission to the signature,
+and an ad-hoc signature changes on every build, so it asks again after each rebuild.
+
+## Known limitations
+
+- **No metadata.** Snapweb shows no track titles for this stream.
+- **No system volume keys** while muted locally. Use per-client volume in Snapweb.
+- **A/V sync.** Audio arrives `buffer` ms late, which is visible on video. IINA and VLC
+  have an audio-offset control.
+- **Excluding apps isn't exposed yet.** The tap captures everything the Mac plays, alert
+  sounds included.
